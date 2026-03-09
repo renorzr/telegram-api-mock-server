@@ -1,30 +1,35 @@
 {
-  "name": "telegram-api-mock-server",
-  "version": "0.1.2",
-  "description": "Telegram Bot API mock server for local and CI tests",
-  "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "files": [
-    "dist",
-    "README.md"
-  ],
-  "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/src/cli.js start",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test dist/tests/**/*.test.js",
-    "test:src": "tsx --test tests/**/*.test.ts"
-  },
-  "devDependencies": {
-    "@types/node": "^22.13.11",
-    "tsx": "^4.19.2",
-    "typescript": "^5.8.2"
-  },
-  "engines": {
-    "node": ">=22"
-  },
-  "bin": {
-    "telegram-api-mock-server": "dist/src/cli.js"
-  }
+    "name": "telegram-api-mock-server",
+    "version": "0.1.8",
+    "description": "Telegram Bot API mock server for local and CI tests",
+    "homepage": "https://renorzr.github.io/clawchef",
+    "repository": {
+      "type": "git",
+      "url": "git+https://github.com/renorzr/clawchef.git"
+    },
+    "type": "module",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "files": [
+        "dist",
+        "README.md"
+    ],
+    "scripts": {
+        "build": "tsc -p tsconfig.json",
+        "start": "node dist/src/cli.js start",
+        "typecheck": "tsc -p tsconfig.json --noEmit",
+        "test": "node --test dist/tests/**/*.test.js",
+        "test:src": "tsx --test tests/**/*.test.ts"
+    },
+    "devDependencies": {
+        "@types/node": "^22.13.11",
+        "tsx": "^4.19.2",
+        "typescript": "^5.8.2"
+    },
+    "engines": {
+        "node": ">=22"
+    },
+    "bin": {
+        "telegram-api-mock-server": "dist/src/cli.js"
+    }
 }

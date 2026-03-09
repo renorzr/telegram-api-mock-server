@@ -12,7 +12,7 @@ export class TelegramApiMockAdminError extends Error {
 }
 
 export type TelegramApiMockAdminClientOptions = {
-  baseUrl: string;
+  baseUrl?: string;
   adminToken?: string;
   fetchImpl?: typeof fetch;
 };
@@ -24,20 +24,50 @@ export type TelegramApiMockAdminStatus = {
   hostsHijackActive: boolean;
 };
 
+export type TelegramApiMockInjectUpdateResponse = {
+  ok: true;
+  update: Record<string, unknown>;
+};
+
+export type TelegramApiMockListOutboundResponse = {
+  ok: true;
+  events: Array<{
+    token: string;
+    method: string;
+    payload: Record<string, unknown>;
+    ts: string;
+  }>;
+};
+
+export type TelegramApiMockResetResponse = {
+  ok: true;
+  reset: true;
+};
+
+export type TelegramApiMockHealthResponse = {
+  ok: true;
+  mode: TelegramApiMockMode;
+};
+
 function trimSlash(value: string): string {
   return value.replace(/\/+$/, "");
 }
 
-export function createTelegramApiMockAdminClient(options: TelegramApiMockAdminClientOptions) {
+const DEFAULT_ADMIN_BASE_URL = "http://127.0.0.1:19091";
+const ENV_ADMIN_BASE_URL = "TELEGRAM_API_MOCK_ADMIN_BASE_URL";
+const ENV_ADMIN_TOKEN = "TELEGRAM_API_MOCK_ADMIN_TOKEN";
+
+export function createTelegramApiMockAdminClient(options: TelegramApiMockAdminClientOptions = {}) {
   const fetchImpl = options.fetchImpl ?? fetch;
-  const base = trimSlash(options.baseUrl);
+  const base = trimSlash(options.baseUrl ?? process.env[ENV_ADMIN_BASE_URL] ?? DEFAULT_ADMIN_BASE_URL);
+  const adminToken = options.adminToken ?? process.env[ENV_ADMIN_TOKEN];
 
   async function request<T>(path: string, init: RequestInit): Promise<T> {
     const headers: Record<string, string> = {
       ...(init.headers as Record<string, string> | undefined),
     };
-    if (options.adminToken?.trim()) {
-      headers["x-admin-token"] = options.adminToken.trim();
+    if (adminToken?.trim()) {
+      headers["x-admin-token"] = adminToken.trim();
     }
     const res = await fetchImpl(`${base}${path}`, {
       ...init,
@@ -85,6 +115,31 @@ export function createTelegramApiMockAdminClient(options: TelegramApiMockAdminCl
     },
     async disableMock(): Promise<{ ok: true; mode: TelegramApiMockMode }> {
       return setMode("passthrough");
+    },
+    async injectUpdate(input: {
+      token: string;
+      update: Record<string, unknown>;
+    }): Promise<TelegramApiMockInjectUpdateResponse> {
+      return request<TelegramApiMockInjectUpdateResponse>("/_mock/injectUpdate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input),
+      });
+    },
+    async listOutbound(token: string): Promise<TelegramApiMockListOutboundResponse> {
+      return request<TelegramApiMockListOutboundResponse>(`/_mock/outbound?token=${encodeURIComponent(token)}`, {
+        method: "GET",
+      });
+    },
+    async reset(input?: { token?: string; updates?: boolean; outbound?: boolean }): Promise<TelegramApiMockResetResponse> {
+      return request<TelegramApiMockResetResponse>("/_mock/reset", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input ?? {}),
+      });
+    },
+    async health(): Promise<TelegramApiMockHealthResponse> {
+      return request<TelegramApiMockHealthResponse>("/_mock/health", { method: "GET" });
     },
   };
 }

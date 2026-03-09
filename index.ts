@@ -12,4 +12,8 @@ export type {
   TelegramApiMockAdminClient,
   TelegramApiMockAdminClientOptions,
   TelegramApiMockAdminStatus,
+  TelegramApiMockInjectUpdateResponse,
+  TelegramApiMockListOutboundResponse,
+  TelegramApiMockResetResponse,
+  TelegramApiMockHealthResponse,
 } from "./src/admin-sdk.js";

@@ -5,6 +5,7 @@ import { resolve4 } from "node:dns/promises";
 import { TelegramApiMockServer, type TelegramApiMockMode } from "./telegram-api-mock-server.js";
 
 type InterceptMode = "hosts" | "nftables";
+type MockCommandAction = "on" | "off";
 
 type CliOptions = {
   host: string;
@@ -26,6 +27,8 @@ type CliOptions = {
   matchUid?: number;
   refreshSeconds: number;
   adminToken?: string;
+  adminHost: string;
+  adminPort: number;
   upstreamBaseUrl?: string;
   serviceName: string;
   noSudoReexec: boolean;
@@ -47,6 +50,8 @@ const DEFAULTS: CliOptions = {
   nftChain: "out_redirect",
   nftSet: "telegram_api_targets",
   refreshSeconds: 60,
+  adminHost: "127.0.0.1",
+  adminPort: 19091,
   serviceName: "telegram-api-mock-server",
   noSudoReexec: false,
 };
@@ -62,7 +67,7 @@ function printHelp(): void {
       "  install-service   Install and start systemd service",
       "  uninstall-service Stop and remove systemd service",
       "  status            Show runtime/install status",
-      "  print-ca-path     Print generated test CA path",
+      "  mock <on|off>     Toggle runtime mock mode",
       "",
       "Common options:",
       "  --host <host>                    Bind host (default: 127.0.0.1)",
@@ -81,12 +86,14 @@ function printHelp(): void {
       "  --nft-set <name>                 nftables set name",
       "  --match-uid <uid>                Restrict redirect to process UID",
       "  --refresh-seconds <n>            nftables target refresh interval (default: 60)",
+      "  --admin-host <host>              Admin HTTP bind host (default: 127.0.0.1)",
+      "  --admin-port <port>              Admin HTTP bind port (default: 19091)",
       "  --cert-dir <path>                Cert directory (default: /etc/telegram-mock)",
       "  --tls-cert <path>                TLS cert path (default: <cert-dir>/<domain>.crt)",
       "  --tls-key <path>                 TLS key path (default: <cert-dir>/<domain>.key)",
       "  --upstream-base-url <url>        Passthrough upstream URL",
       "  --service-name <name>            systemd service name",
-    ].join("\n"),
+    ].join("\n") + "\n",
   );
 }
 
@@ -117,6 +124,16 @@ function parseArgs(argv: string[]): CliOptions {
     }
     if (arg === "--admin-token" && next) {
       options.adminToken = next;
+      i += 1;
+      continue;
+    }
+    if (arg === "--admin-host" && next) {
+      options.adminHost = next;
+      i += 1;
+      continue;
+    }
+    if (arg === "--admin-port" && next) {
+      options.adminPort = Number(next);
       i += 1;
       continue;
     }
@@ -217,6 +234,9 @@ function parseArgs(argv: string[]): CliOptions {
   if (!Number.isFinite(options.refreshSeconds) || options.refreshSeconds < 5) {
     throw new Error("--refresh-seconds must be at least 5");
   }
+  if (!Number.isFinite(options.adminPort) || options.adminPort <= 0) {
+    throw new Error("--admin-port must be a positive number");
+  }
   if ((options.tlsCertPath && !options.tlsKeyPath) || (!options.tlsCertPath && options.tlsKeyPath)) {
     throw new Error("--tls-cert and --tls-key must be provided together");
   }
@@ -242,6 +262,70 @@ function runCommandCapture(command: string, args: string[]): { status: number; s
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
   };
+}
+
+function buildAdminHeaders(options: CliOptions): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (options.adminToken?.trim()) {
+    headers["x-admin-token"] = options.adminToken.trim();
+  }
+  return headers;
+}
+
+async function getMockRuntimeState(options: CliOptions): Promise<{
+  mockReachable: boolean;
+  mockMode: TelegramApiMockMode | null;
+  mockEnabled: boolean | null;
+}> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, 2000);
+  try {
+    const response = await fetch(`http://${options.adminHost}:${options.adminPort}/_mock/health`, {
+      method: "GET",
+      headers: buildAdminHeaders(options),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return {
+        mockReachable: false,
+        mockMode: null,
+        mockEnabled: null,
+      };
+    }
+    const payload = (await response.json()) as { mode?: unknown };
+    const mode = payload.mode === "mock" || payload.mode === "passthrough" ? payload.mode : null;
+    return {
+      mockReachable: mode !== null,
+      mockMode: mode,
+      mockEnabled: mode === null ? null : mode === "mock",
+    };
+  } catch {
+    return {
+      mockReachable: false,
+      mockMode: null,
+      mockEnabled: null,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function setMockMode(options: CliOptions, mode: TelegramApiMockMode): Promise<void> {
+  const response = await fetch(`http://${options.adminHost}:${options.adminPort}/_admin/mode`, {
+    method: "POST",
+    headers: {
+      ...buildAdminHeaders(options),
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ mode }),
+  });
+  const body = (await response.json().catch(() => ({}))) as { error?: { message?: string } };
+  if (!response.ok) {
+    const message = body.error?.message ?? `Admin API returned HTTP ${response.status}`;
+    throw new Error(message);
+  }
 }
 
 function maybeRunSudo(command: string, args: string[]): void {
@@ -496,6 +580,10 @@ function buildServiceUnit(options: CliOptions): string {
     options.nftSet,
     "--refresh-seconds",
     String(options.refreshSeconds),
+    "--admin-host",
+    options.adminHost,
+    "--admin-port",
+    String(options.adminPort),
     "--cert-dir",
     options.certDir,
     "--no-sudo-reexec",
@@ -590,6 +678,7 @@ async function commandStatus(options: CliOptions): Promise<void> {
   }
   const nftablesRedirectActive = isNftablesRedirectActive(options);
   const nftablesInspectable = canInspectNftables(options);
+  const mockState = await getMockRuntimeState(options);
   process.stdout.write(
     `${JSON.stringify({
       serviceInstalled,
@@ -601,10 +690,22 @@ async function commandStatus(options: CliOptions): Promise<void> {
       nftablesRedirectActive,
       nftablesInspectable,
       refreshSeconds: options.refreshSeconds,
+      adminHost: options.adminHost,
+      adminPort: options.adminPort,
       serviceName: options.serviceName,
       certDir: options.certDir,
+      caPath: tls.caPath,
+      mockReachable: mockState.mockReachable,
+      mockMode: mockState.mockMode,
+      mockEnabled: mockState.mockEnabled,
     })}\n`,
   );
+}
+
+async function commandMock(options: CliOptions, action: MockCommandAction): Promise<void> {
+  const mode: TelegramApiMockMode = action === "on" ? "mock" : "passthrough";
+  await setMockMode(options, mode);
+  process.stdout.write(`[telegram-api-mock-server] mode=${mode}\n`);
 }
 
 async function commandStart(options: CliOptions): Promise<void> {
@@ -625,6 +726,8 @@ async function commandStart(options: CliOptions): Promise<void> {
     mode: options.mode,
     admin: {
       token: options.adminToken,
+      host: options.adminHost,
+      port: options.adminPort,
     },
     tls: { certPath: tls.certPath, keyPath: tls.keyPath },
     interception: {
@@ -651,6 +754,10 @@ async function commandStart(options: CliOptions): Promise<void> {
   process.stdout.write(
     `[telegram-api-mock-server] listening on ${addr?.host ?? options.host}:${addr?.port ?? options.port} mode=${server.getMode()}\n`,
   );
+  const adminAddr = server.getAdminAddress();
+  if (adminAddr) {
+    process.stdout.write(`[telegram-api-mock-server] admin on http://${adminAddr.host}:${adminAddr.port}\n`);
+  }
   process.stdout.write(`[telegram-api-mock-server] NODE_EXTRA_CA_CERTS=${tls.caPath}\n`);
 
   let refreshTimer: ReturnType<typeof setInterval> | undefined;
@@ -692,6 +799,16 @@ async function run(): Promise<void> {
     return;
   }
 
+  if (command === "mock") {
+    const action = process.argv[3];
+    if (action !== "on" && action !== "off") {
+      throw new Error("mock command requires action 'on' or 'off'");
+    }
+    const options = parseArgs(process.argv.slice(4));
+    await commandMock(options, action);
+    return;
+  }
+
   const options = parseArgs(process.argv.slice(3));
 
   if (command === "start") {
@@ -712,11 +829,6 @@ async function run(): Promise<void> {
   }
   if (command === "status") {
     await commandStatus(options);
-    return;
-  }
-  if (command === "print-ca-path") {
-    const tls = resolveTlsPaths(options);
-    process.stdout.write(`${tls.caPath}\n`);
     return;
   }
 

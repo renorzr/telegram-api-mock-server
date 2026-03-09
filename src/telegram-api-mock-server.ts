@@ -12,6 +12,8 @@ export type TelegramApiMockServerOptions = {
   mode?: TelegramApiMockMode;
   admin?: {
     token?: string;
+    host?: string;
+    port?: number;
   };
   tls?: {
     certPath: string;
@@ -45,6 +47,7 @@ export type TelegramApiMockOutboundCall = {
 type TokenState = {
   updates: TelegramUpdate[];
   outbound: TelegramApiMockOutboundCall[];
+  commands: Array<Record<string, unknown>>;
   nextUpdateId: number;
   nextMessageId: number;
 };
@@ -130,6 +133,8 @@ export class TelegramApiMockServer {
   private readonly port: number;
   private mode: TelegramApiMockMode;
   private readonly adminToken?: string;
+  private readonly adminHost?: string;
+  private readonly adminPort?: number;
   private readonly tls?: TelegramApiMockServerOptions["tls"];
   private readonly interception: Required<NonNullable<TelegramApiMockServerOptions["interception"]>>;
   private readonly upstreamBaseUrl: URL;
@@ -137,6 +142,7 @@ export class TelegramApiMockServer {
   private readonly bypassHostsForTelegramDomain: boolean;
   private readonly states = new Map<string, TokenState>();
   private readonly server: ReturnType<typeof createServer> | TlsServer;
+  private readonly adminServer?: ReturnType<typeof createServer>;
   private installedExitCleanup = false;
   private cachedTelegramIp: string | null = null;
 
@@ -145,6 +151,8 @@ export class TelegramApiMockServer {
     this.port = options.port ?? 19090;
     this.mode = options.mode ?? "mock";
     this.adminToken = options.admin?.token?.trim() || undefined;
+    this.adminHost = options.admin?.host?.trim() || undefined;
+    this.adminPort = options.admin?.port;
     this.tls = options.tls;
     this.interception = {
       enableHostsHijack: options.interception?.enableHostsHijack ?? false,
@@ -172,6 +180,12 @@ export class TelegramApiMockServer {
         void this.route(req, res);
       });
     }
+
+    if (this.adminHost && this.adminPort != null && this.adminPort >= 0) {
+      this.adminServer = createServer((req, res) => {
+        void this.routeAdminOnly(req, res);
+      });
+    }
   }
 
   async start(): Promise<void> {
@@ -187,9 +201,21 @@ export class TelegramApiMockServer {
           resolve();
         });
       });
+      if (this.adminServer && this.adminHost && this.adminPort != null) {
+        await new Promise<void>((resolve, reject) => {
+          this.adminServer!.once("error", reject);
+          this.adminServer!.listen(this.adminPort, this.adminHost, () => {
+            this.adminServer!.off("error", reject);
+            resolve();
+          });
+        });
+      }
     } catch (error) {
       if (this.interception.enableHostsHijack) {
         this.removeHostsHijack();
+      }
+      if (this.adminServer) {
+        this.adminServer.close();
       }
       throw error;
     }
@@ -205,6 +231,17 @@ export class TelegramApiMockServer {
         resolve();
       });
     });
+    if (this.adminServer) {
+      await new Promise<void>((resolve, reject) => {
+        this.adminServer!.close((err) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+          resolve();
+        });
+      });
+    }
     if (this.interception.enableHostsHijack) {
       this.removeHostsHijack();
     }
@@ -212,6 +249,20 @@ export class TelegramApiMockServer {
 
   getAddress(): { host: string; port: number } | null {
     const address = this.server.address();
+    if (!address || typeof address === "string") {
+      return null;
+    }
+    return {
+      host: address.address,
+      port: address.port,
+    };
+  }
+
+  getAdminAddress(): { host: string; port: number } | null {
+    if (!this.adminServer) {
+      return null;
+    }
+    const address = this.adminServer.address();
     if (!address || typeof address === "string") {
       return null;
     }
@@ -328,6 +379,7 @@ export class TelegramApiMockServer {
     const created: TokenState = {
       updates: [],
       outbound: [],
+      commands: [],
       nextUpdateId: 1,
       nextMessageId: 1,
     };
@@ -370,6 +422,35 @@ export class TelegramApiMockServer {
         type: typeof chatId === "number" && chatId < 0 ? "group" : "private",
       },
       text,
+    };
+  }
+
+  private buildMediaMessageResult(token: string, payload: Record<string, unknown>, mediaField: "photo" | "document") {
+    const base = this.buildMessageResult(token, payload);
+    if (mediaField === "photo") {
+      const photo = asString(payload.photo) ?? "mock-photo";
+      return {
+        ...base,
+        photo: [
+          {
+            file_id: `photo-${photo}`,
+            file_unique_id: `uniq-photo-${photo}`,
+            file_size: 1,
+            width: 1,
+            height: 1,
+          },
+        ],
+      };
+    }
+    const document = asString(payload.document) ?? "mock-document";
+    return {
+      ...base,
+      document: {
+        file_id: `doc-${document}`,
+        file_unique_id: `uniq-doc-${document}`,
+        file_name: document,
+        file_size: 1,
+      },
     };
   }
 
@@ -462,80 +543,21 @@ export class TelegramApiMockServer {
   private async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://localhost");
 
-    if (req.method === "GET" && url.pathname === "/_admin/status") {
-      if (!hasAdminAccess(req, this.adminToken)) {
-        writeJson(res, 401, { ok: false, error: { code: "MOCK_AUTH_INVALID", message: "Admin token invalid" } });
-        return;
-      }
-      writeJson(res, 200, {
-        ok: true,
-        mode: this.mode,
-        interceptionConfigured: this.interception.enableHostsHijack,
-        hostsHijackActive: this.isHostsHijackActive(),
-      });
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/_admin/mode") {
-      if (!hasAdminAccess(req, this.adminToken)) {
-        writeJson(res, 401, { ok: false, error: { code: "MOCK_AUTH_INVALID", message: "Admin token invalid" } });
-        return;
-      }
-      const body = await readJsonBody(req);
-      const mode = asString(body.mode);
-      if (mode !== "mock" && mode !== "passthrough") {
-        writeJson(res, 400, {
+    if (this.adminServer) {
+      if (url.pathname.startsWith("/_admin") || url.pathname.startsWith("/_mock")) {
+        writeJson(res, 404, {
           ok: false,
-          error: { code: "MOCK_BAD_REQUEST", message: "mode must be 'mock' or 'passthrough'" },
+          error: {
+            code: "MOCK_CONTROL_PLANE_ON_ADMIN",
+            message: "Control plane is exposed on the admin server only",
+          },
         });
         return;
       }
-      this.mode = mode;
-      writeJson(res, 200, { ok: true, mode: this.mode });
-      return;
-    }
-
-    if (url.pathname === "/_mock/health") {
-      writeJson(res, 200, { ok: true, mode: this.mode });
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/_mock/injectUpdate") {
-      const body = await readJsonBody(req);
-      const token = asString(body.token);
-      if (!token) {
-        writeJson(res, 400, { ok: false, error: { code: "MOCK_BAD_REQUEST", message: "Missing token" } });
+    } else {
+      if (await this.handleControlPlaneRoute(req, res, url)) {
         return;
       }
-      const inputUpdate = body.update && typeof body.update === "object" ? (body.update as TelegramUpdate) : null;
-      if (!inputUpdate) {
-        writeJson(res, 400, { ok: false, error: { code: "MOCK_BAD_REQUEST", message: "Missing update object" } });
-        return;
-      }
-      const injected = this.injectUpdate({ token, update: inputUpdate });
-      writeJson(res, 200, { ok: true, update: injected });
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/_mock/outbound") {
-      const token = asString(url.searchParams.get("token"));
-      if (!token) {
-        writeJson(res, 400, { ok: false, error: { code: "MOCK_BAD_REQUEST", message: "Missing token query" } });
-        return;
-      }
-      writeJson(res, 200, { ok: true, events: this.listOutbound(token) });
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/_mock/reset") {
-      const body = await readJsonBody(req);
-      this.reset({
-        token: asString(body.token),
-        updates: typeof body.updates === "boolean" ? body.updates : undefined,
-        outbound: typeof body.outbound === "boolean" ? body.outbound : undefined,
-      });
-      writeJson(res, 200, { ok: true, reset: true });
-      return;
     }
 
     const parsed = parseTelegramMethodPath(url.pathname);
@@ -576,6 +598,37 @@ export class TelegramApiMockServer {
       return;
     }
 
+    if (method === "setMyCommands") {
+      const state = this.ensureState(token);
+      const commands = payload.commands;
+      if (!Array.isArray(commands)) {
+        writeJson(res, 400, {
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: commands must be an array",
+        });
+        return;
+      }
+      state.commands = commands.filter((value): value is Record<string, unknown> => {
+        return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+      });
+      writeJson(res, 200, { ok: true, result: true });
+      return;
+    }
+
+    if (method === "deleteMyCommands") {
+      const state = this.ensureState(token);
+      state.commands = [];
+      writeJson(res, 200, { ok: true, result: true });
+      return;
+    }
+
+    if (method === "getMyCommands") {
+      const state = this.ensureState(token);
+      writeJson(res, 200, { ok: true, result: state.commands });
+      return;
+    }
+
     if (method === "getWebhookInfo") {
       writeJson(res, 200, {
         ok: true,
@@ -606,6 +659,33 @@ export class TelegramApiMockServer {
       return;
     }
 
+    if (method === "sendPhoto") {
+      this.recordOutbound(token, method, payload);
+      writeJson(res, 200, {
+        ok: true,
+        result: this.buildMediaMessageResult(token, payload, "photo"),
+      });
+      return;
+    }
+
+    if (method === "sendDocument") {
+      this.recordOutbound(token, method, payload);
+      writeJson(res, 200, {
+        ok: true,
+        result: this.buildMediaMessageResult(token, payload, "document"),
+      });
+      return;
+    }
+
+    if (method === "sendChatAction") {
+      this.recordOutbound(token, method, payload);
+      writeJson(res, 200, {
+        ok: true,
+        result: true,
+      });
+      return;
+    }
+
     if (method === "editMessageText") {
       this.recordOutbound(token, method, payload);
       writeJson(res, 200, {
@@ -631,10 +711,107 @@ export class TelegramApiMockServer {
       return;
     }
 
+    if (method === "deleteMessage" || method === "pinChatMessage" || method === "unpinChatMessage") {
+      this.recordOutbound(token, method, payload);
+      writeJson(res, 200, {
+        ok: true,
+        result: true,
+      });
+      return;
+    }
+
     writeJson(res, 404, {
       ok: false,
       error_code: 404,
       description: `Method ${method} not mocked`,
     });
+  }
+
+  private async routeAdminOnly(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    if (await this.handleControlPlaneRoute(req, res, url)) {
+      return;
+    }
+    writeJson(res, 404, { ok: false, error: { code: "MOCK_NOT_FOUND", message: "Admin route not found" } });
+  }
+
+  private async handleControlPlaneRoute(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+    if (req.method === "GET" && url.pathname === "/_admin/status") {
+      if (!hasAdminAccess(req, this.adminToken)) {
+        writeJson(res, 401, { ok: false, error: { code: "MOCK_AUTH_INVALID", message: "Admin token invalid" } });
+        return true;
+      }
+      writeJson(res, 200, {
+        ok: true,
+        mode: this.mode,
+        interceptionConfigured: this.interception.enableHostsHijack,
+        hostsHijackActive: this.isHostsHijackActive(),
+      });
+      return true;
+    }
+
+    if (req.method === "POST" && url.pathname === "/_admin/mode") {
+      if (!hasAdminAccess(req, this.adminToken)) {
+        writeJson(res, 401, { ok: false, error: { code: "MOCK_AUTH_INVALID", message: "Admin token invalid" } });
+        return true;
+      }
+      const body = await readJsonBody(req);
+      const mode = asString(body.mode);
+      if (mode !== "mock" && mode !== "passthrough") {
+        writeJson(res, 400, {
+          ok: false,
+          error: { code: "MOCK_BAD_REQUEST", message: "mode must be 'mock' or 'passthrough'" },
+        });
+        return true;
+      }
+      this.mode = mode;
+      writeJson(res, 200, { ok: true, mode: this.mode });
+      return true;
+    }
+
+    if (url.pathname === "/_mock/health") {
+      writeJson(res, 200, { ok: true, mode: this.mode });
+      return true;
+    }
+
+    if (req.method === "POST" && url.pathname === "/_mock/injectUpdate") {
+      const body = await readJsonBody(req);
+      const token = asString(body.token);
+      if (!token) {
+        writeJson(res, 400, { ok: false, error: { code: "MOCK_BAD_REQUEST", message: "Missing token" } });
+        return true;
+      }
+      const inputUpdate = body.update && typeof body.update === "object" ? (body.update as TelegramUpdate) : null;
+      if (!inputUpdate) {
+        writeJson(res, 400, { ok: false, error: { code: "MOCK_BAD_REQUEST", message: "Missing update object" } });
+        return true;
+      }
+      const injected = this.injectUpdate({ token, update: inputUpdate });
+      writeJson(res, 200, { ok: true, update: injected });
+      return true;
+    }
+
+    if (req.method === "GET" && url.pathname === "/_mock/outbound") {
+      const token = asString(url.searchParams.get("token"));
+      if (!token) {
+        writeJson(res, 400, { ok: false, error: { code: "MOCK_BAD_REQUEST", message: "Missing token query" } });
+        return true;
+      }
+      writeJson(res, 200, { ok: true, events: this.listOutbound(token) });
+      return true;
+    }
+
+    if (req.method === "POST" && url.pathname === "/_mock/reset") {
+      const body = await readJsonBody(req);
+      this.reset({
+        token: asString(body.token),
+        updates: typeof body.updates === "boolean" ? body.updates : undefined,
+        outbound: typeof body.outbound === "boolean" ? body.outbound : undefined,
+      });
+      writeJson(res, 200, { ok: true, reset: true });
+      return true;
+    }
+
+    return false;
   }
 }

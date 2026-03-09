@@ -157,3 +157,108 @@ test("passthrough mode forwards bot methods to upstream server", async () => {
     });
   });
 });
+
+test("mock server supports myCommands lifecycle", async () => {
+  const server = new TelegramApiMockServer({ host: "127.0.0.1", port: 0 });
+  await server.start();
+  const addr = server.getAddress();
+  assert.ok(addr);
+
+  const token = "7777:commands";
+  const base = `http://127.0.0.1:${addr!.port}`;
+
+  const setRes = await fetch(`${base}/bot${token}/setMyCommands`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      commands: [
+        { command: "start", description: "Start bot" },
+        { command: "help", description: "Show help" },
+      ],
+    }),
+  });
+  assert.equal(setRes.status, 200);
+  const setJson = (await setRes.json()) as { ok: boolean; result?: boolean };
+  assert.equal(setJson.ok, true);
+  assert.equal(setJson.result, true);
+
+  const getRes = await fetch(`${base}/bot${token}/getMyCommands`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(getRes.status, 200);
+  const getJson = (await getRes.json()) as {
+    ok: boolean;
+    result: Array<{ command: string; description: string }>;
+  };
+  assert.equal(getJson.ok, true);
+  assert.equal(getJson.result.length, 2);
+  assert.equal(getJson.result[0]?.command, "start");
+
+  const delRes = await fetch(`${base}/bot${token}/deleteMyCommands`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(delRes.status, 200);
+  const delJson = (await delRes.json()) as { ok: boolean; result?: boolean };
+  assert.equal(delJson.ok, true);
+  assert.equal(delJson.result, true);
+
+  const getAfterDelRes = await fetch(`${base}/bot${token}/getMyCommands`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(getAfterDelRes.status, 200);
+  const getAfterDelJson = (await getAfterDelRes.json()) as { ok: boolean; result: Array<unknown> };
+  assert.equal(getAfterDelJson.ok, true);
+  assert.equal(getAfterDelJson.result.length, 0);
+
+  await server.stop();
+});
+
+test("mock server supports additional common outbound methods", async () => {
+  const server = new TelegramApiMockServer({ host: "127.0.0.1", port: 0 });
+  await server.start();
+  const addr = server.getAddress();
+  assert.ok(addr);
+
+  const token = "9999:common";
+  const base = `http://127.0.0.1:${addr!.port}`;
+
+  const methodCalls: Array<{ method: string; payload: Record<string, unknown> }> = [
+    { method: "sendChatAction", payload: { chat_id: 42, action: "typing" } },
+    { method: "sendPhoto", payload: { chat_id: 42, photo: "file-photo", caption: "img" } },
+    { method: "sendDocument", payload: { chat_id: 42, document: "file-doc", caption: "doc" } },
+    { method: "deleteMessage", payload: { chat_id: 42, message_id: 10 } },
+    { method: "pinChatMessage", payload: { chat_id: 42, message_id: 11 } },
+    { method: "unpinChatMessage", payload: { chat_id: 42, message_id: 11 } },
+  ];
+
+  for (const call of methodCalls) {
+    const response = await fetch(`${base}/bot${token}/${call.method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(call.payload),
+    });
+    assert.equal(response.status, 200);
+    const json = (await response.json()) as { ok: boolean };
+    assert.equal(json.ok, true);
+  }
+
+  const outboundRes = await fetch(`${base}/_mock/outbound?token=${encodeURIComponent(token)}`);
+  assert.equal(outboundRes.status, 200);
+  const outbound = (await outboundRes.json()) as {
+    ok: boolean;
+    events: Array<{ method: string }>;
+  };
+  assert.equal(outbound.ok, true);
+  const methodSet = new Set(outbound.events.map((event) => event.method));
+  for (const call of methodCalls) {
+    assert.equal(methodSet.has(call.method), true);
+  }
+
+  await server.stop();
+});
