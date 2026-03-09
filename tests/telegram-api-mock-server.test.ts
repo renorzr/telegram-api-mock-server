@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer, type Server } from "node:http";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -93,4 +94,66 @@ test("hosts hijack is applied on start and removed on stop", async () => {
   const stoppedHosts = readFileSync(hostsPath, "utf8");
   assert.doesNotMatch(stoppedHosts, /BEGIN tg-mock-test/);
   assert.doesNotMatch(stoppedHosts, /api\.telegram\.org/);
+});
+
+test("passthrough mode forwards bot methods to upstream server", async () => {
+  let seenPath = "";
+  let seenMethod = "";
+  let seenBody = "";
+  const upstream = await new Promise<Server>((resolve) => {
+    const server = createServer((req, res) => {
+      seenPath = req.url ?? "";
+      seenMethod = req.method ?? "";
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      req.on("end", () => {
+        seenBody = Buffer.concat(chunks).toString("utf8");
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ ok: true, result: { upstream: true } }));
+      });
+    });
+    server.listen(0, "127.0.0.1", () => resolve(server));
+  });
+  const upstreamAddr = upstream.address();
+  assert.ok(upstreamAddr && typeof upstreamAddr !== "string");
+
+  const server = new TelegramApiMockServer({
+    host: "127.0.0.1",
+    port: 0,
+    mode: "passthrough",
+    passthrough: {
+      upstreamBaseUrl: `http://127.0.0.1:${upstreamAddr.port}`,
+      bypassHostsForTelegramDomain: false,
+    },
+  });
+  await server.start();
+  const addr = server.getAddress();
+  assert.ok(addr);
+
+  const token = "1234:test";
+  const response = await fetch(`http://127.0.0.1:${addr!.port}/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: 1, text: "hello" }),
+  });
+  assert.equal(response.status, 200);
+  const payload = (await response.json()) as { ok: boolean; result?: { upstream?: boolean } };
+  assert.equal(payload.ok, true);
+  assert.equal(payload.result?.upstream, true);
+  assert.equal(seenMethod, "POST");
+  assert.equal(seenPath, `/bot${token}/sendMessage`);
+  assert.match(seenBody, /"text":"hello"/);
+
+  await server.stop();
+  await new Promise<void>((resolve, reject) => {
+    upstream.close((err) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve();
+    });
+  });
 });

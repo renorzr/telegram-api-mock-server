@@ -1,10 +1,18 @@
+import { request as httpRequest } from "node:http";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { createServer as createTlsServer, type Server as TlsServer } from "node:https";
+import { request as httpsRequest, createServer as createTlsServer, type Server as TlsServer } from "node:https";
 import { readFileSync, writeFileSync } from "node:fs";
+import { resolve4 } from "node:dns/promises";
 
-type TelegramApiMockServerOptions = {
+export type TelegramApiMockMode = "mock" | "passthrough";
+
+export type TelegramApiMockServerOptions = {
   host?: string;
   port?: number;
+  mode?: TelegramApiMockMode;
+  admin?: {
+    token?: string;
+  };
   tls?: {
     certPath: string;
     keyPath: string;
@@ -15,6 +23,11 @@ type TelegramApiMockServerOptions = {
     domain?: string;
     ip?: string;
     marker?: string;
+  };
+  passthrough?: {
+    upstreamBaseUrl?: string;
+    timeoutMs?: number;
+    bypassHostsForTelegramDomain?: boolean;
   };
 };
 
@@ -87,7 +100,7 @@ function asString(value: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function parseTelegramMethodPathSafe(pathname: string): { token: string; method: string } | null {
+function parseTelegramMethodPath(pathname: string): { token: string; method: string } | null {
   const trimmed = pathname.startsWith("/") ? pathname.slice(1) : pathname;
   const match = trimmed.match(/^bot([^/]+)\/([^/]+)$/);
   if (!match) {
@@ -101,26 +114,49 @@ function parseTelegramMethodPathSafe(pathname: string): { token: string; method:
   return { token, method };
 }
 
+function hasAdminAccess(req: IncomingMessage, token?: string): boolean {
+  if (!token) {
+    return true;
+  }
+  const bearer = req.headers.authorization;
+  if (bearer === `Bearer ${token}`) {
+    return true;
+  }
+  return req.headers["x-admin-token"] === token;
+}
+
 export class TelegramApiMockServer {
   private readonly host: string;
   private readonly port: number;
+  private mode: TelegramApiMockMode;
+  private readonly adminToken?: string;
   private readonly tls?: TelegramApiMockServerOptions["tls"];
   private readonly interception: Required<NonNullable<TelegramApiMockServerOptions["interception"]>>;
+  private readonly upstreamBaseUrl: URL;
+  private readonly passthroughTimeoutMs: number;
+  private readonly bypassHostsForTelegramDomain: boolean;
   private readonly states = new Map<string, TokenState>();
   private readonly server: ReturnType<typeof createServer> | TlsServer;
   private installedExitCleanup = false;
+  private cachedTelegramIp: string | null = null;
 
   constructor(options: TelegramApiMockServerOptions = {}) {
     this.host = options.host ?? "127.0.0.1";
     this.port = options.port ?? 19090;
+    this.mode = options.mode ?? "mock";
+    this.adminToken = options.admin?.token?.trim() || undefined;
     this.tls = options.tls;
     this.interception = {
       enableHostsHijack: options.interception?.enableHostsHijack ?? false,
       hostsFilePath: options.interception?.hostsFilePath ?? "/etc/hosts",
       domain: options.interception?.domain ?? "api.telegram.org",
       ip: options.interception?.ip ?? "127.0.0.1",
-      marker: options.interception?.marker ?? "telegram-mock-channel",
+      marker: options.interception?.marker ?? "telegram-api-mock-server",
     };
+    this.upstreamBaseUrl = new URL(options.passthrough?.upstreamBaseUrl ?? "https://api.telegram.org");
+    this.passthroughTimeoutMs = options.passthrough?.timeoutMs ?? 15000;
+    this.bypassHostsForTelegramDomain = options.passthrough?.bypassHostsForTelegramDomain ?? true;
+
     if (this.tls) {
       this.server = createTlsServer(
         {
@@ -143,13 +179,20 @@ export class TelegramApiMockServer {
       this.applyHostsHijack();
       this.installExitCleanupHandlers();
     }
-    await new Promise<void>((resolve, reject) => {
-      this.server.once("error", reject);
-      this.server.listen(this.port, this.host, () => {
-        this.server.off("error", reject);
-        resolve();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.server.once("error", reject);
+        this.server.listen(this.port, this.host, () => {
+          this.server.off("error", reject);
+          resolve();
+        });
       });
-    });
+    } catch (error) {
+      if (this.interception.enableHostsHijack) {
+        this.removeHostsHijack();
+      }
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
@@ -165,6 +208,25 @@ export class TelegramApiMockServer {
     if (this.interception.enableHostsHijack) {
       this.removeHostsHijack();
     }
+  }
+
+  getAddress(): { host: string; port: number } | null {
+    const address = this.server.address();
+    if (!address || typeof address === "string") {
+      return null;
+    }
+    return {
+      host: address.address,
+      port: address.port,
+    };
+  }
+
+  getMode(): TelegramApiMockMode {
+    return this.mode;
+  }
+
+  setMode(mode: TelegramApiMockMode): void {
+    this.mode = mode;
   }
 
   applyHostsHijack(): void {
@@ -184,49 +246,6 @@ export class TelegramApiMockServer {
     const end = `# END ${this.interception.marker}`;
     const next = this.stripHostsBlock(current, start, end);
     writeFileSync(this.interception.hostsFilePath, `${next.trimEnd()}\n`, "utf8");
-  }
-
-  private stripHostsBlock(input: string, start: string, end: string): string {
-    const escapedStart = start.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const escapedEnd = end.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const pattern = new RegExp(`\\n?${escapedStart}[\\s\\S]*?${escapedEnd}\\n?`, "g");
-    return input.replace(pattern, "\n").replace(/\n{3,}/g, "\n\n");
-  }
-
-  private installExitCleanupHandlers(): void {
-    if (this.installedExitCleanup) {
-      return;
-    }
-    this.installedExitCleanup = true;
-    const cleanup = () => {
-      try {
-        this.removeHostsHijack();
-      } catch {
-        // best-effort cleanup
-      }
-    };
-    process.on("SIGINT", () => {
-      cleanup();
-      process.exit(130);
-    });
-    process.on("SIGTERM", () => {
-      cleanup();
-      process.exit(143);
-    });
-    process.on("exit", () => {
-      cleanup();
-    });
-  }
-
-  getAddress(): { host: string; port: number } | null {
-    const address = this.server.address();
-    if (!address || typeof address === "string") {
-      return null;
-    }
-    return {
-      host: address.address,
-      port: address.port,
-    };
   }
 
   injectUpdate(params: { token: string; update: TelegramUpdate }): TelegramUpdate {
@@ -268,6 +287,27 @@ export class TelegramApiMockServer {
     }
   }
 
+  private stripHostsBlock(input: string, start: string, end: string): string {
+    const escapedStart = start.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedEnd = end.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`\\n?${escapedStart}[\\s\\S]*?${escapedEnd}\\n?`, "g");
+    return input.replace(pattern, "\n").replace(/\n{3,}/g, "\n\n");
+  }
+
+  private installExitCleanupHandlers(): void {
+    if (this.installedExitCleanup) {
+      return;
+    }
+    this.installedExitCleanup = true;
+    process.once("exit", () => {
+      try {
+        this.removeHostsHijack();
+      } catch {
+        // best-effort cleanup
+      }
+    });
+  }
+
   private ensureState(token: string): TokenState {
     const existing = this.states.get(token);
     if (existing) {
@@ -283,7 +323,7 @@ export class TelegramApiMockServer {
     return created;
   }
 
-  private recordOutbound(token: string, method: string, payload: Record<string, unknown>): TelegramApiMockOutboundCall {
+  private recordOutbound(token: string, method: string, payload: Record<string, unknown>): void {
     const state = this.ensureState(token);
     const call: TelegramApiMockOutboundCall = {
       token,
@@ -292,7 +332,6 @@ export class TelegramApiMockServer {
       ts: nowIso(),
     };
     state.outbound.push(call);
-    return call;
   }
 
   private handleGetUpdates(token: string, payload: Record<string, unknown>): TelegramUpdate[] {
@@ -322,11 +361,129 @@ export class TelegramApiMockServer {
     };
   }
 
+  private async resolveTelegramApiIp(): Promise<string> {
+    if (this.cachedTelegramIp) {
+      return this.cachedTelegramIp;
+    }
+    const addresses = await resolve4("api.telegram.org");
+    if (addresses.length === 0) {
+      throw new Error("Failed to resolve api.telegram.org");
+    }
+    this.cachedTelegramIp = addresses[0] ?? null;
+    if (!this.cachedTelegramIp) {
+      throw new Error("Failed to resolve api.telegram.org");
+    }
+    return this.cachedTelegramIp;
+  }
+
+  private async passthroughTelegramRequest(params: {
+    reqMethod: string;
+    token: string;
+    method: string;
+    payload: Record<string, unknown>;
+    res: ServerResponse;
+  }): Promise<void> {
+    const target = new URL(`/bot${params.token}/${params.method}`, this.upstreamBaseUrl);
+    if (params.reqMethod === "GET") {
+      for (const [key, value] of Object.entries(params.payload)) {
+        if (value == null) {
+          continue;
+        }
+        target.searchParams.set(key, String(value));
+      }
+    }
+
+    const client = target.protocol === "https:" ? httpsRequest : httpRequest;
+    const body = params.reqMethod === "GET" ? undefined : JSON.stringify(params.payload);
+
+    const forcedIp =
+      this.bypassHostsForTelegramDomain && target.hostname === "api.telegram.org" && target.protocol === "https:"
+        ? await this.resolveTelegramApiIp()
+        : undefined;
+
+    await new Promise<void>((resolve, reject) => {
+      const upstreamReq = client(
+        {
+          protocol: target.protocol,
+          hostname: target.hostname,
+          port: target.port ? Number(target.port) : undefined,
+          path: `${target.pathname}${target.search}`,
+          method: params.reqMethod,
+          timeout: this.passthroughTimeoutMs,
+          headers: {
+            "content-type": "application/json",
+          },
+          servername: target.hostname,
+          lookup: forcedIp
+            ? (hostname, _options, callback) => {
+                callback(null, forcedIp, 4);
+              }
+            : undefined,
+        },
+        (upstreamRes) => {
+          const chunks: Buffer[] = [];
+          upstreamRes.on("data", (chunk) => {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          });
+          upstreamRes.on("end", () => {
+            params.res.statusCode = upstreamRes.statusCode ?? 502;
+            params.res.setHeader("content-type", upstreamRes.headers["content-type"] ?? "application/json");
+            params.res.end(Buffer.concat(chunks));
+            resolve();
+          });
+        },
+      );
+      upstreamReq.on("error", reject);
+      if (body) {
+        upstreamReq.write(body);
+      }
+      upstreamReq.end();
+    }).catch((error) => {
+      writeJson(params.res, 502, {
+        ok: false,
+        error_code: 502,
+        description: `Passthrough request failed: ${String(error)}`,
+      });
+    });
+  }
+
   private async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://localhost");
 
+    if (req.method === "GET" && url.pathname === "/_admin/status") {
+      if (!hasAdminAccess(req, this.adminToken)) {
+        writeJson(res, 401, { ok: false, error: { code: "MOCK_AUTH_INVALID", message: "Admin token invalid" } });
+        return;
+      }
+      writeJson(res, 200, {
+        ok: true,
+        mode: this.mode,
+        interception: this.interception.enableHostsHijack,
+      });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/_admin/mode") {
+      if (!hasAdminAccess(req, this.adminToken)) {
+        writeJson(res, 401, { ok: false, error: { code: "MOCK_AUTH_INVALID", message: "Admin token invalid" } });
+        return;
+      }
+      const body = await readJsonBody(req);
+      const mode = asString(body.mode);
+      if (mode !== "mock" && mode !== "passthrough") {
+        writeJson(res, 400, {
+          ok: false,
+          error: { code: "MOCK_BAD_REQUEST", message: "mode must be 'mock' or 'passthrough'" },
+        });
+        return;
+      }
+      this.mode = mode;
+      writeJson(res, 200, { ok: true, mode: this.mode });
+      return;
+    }
+
     if (url.pathname === "/_mock/health") {
-      writeJson(res, 200, { ok: true });
+      writeJson(res, 200, { ok: true, mode: this.mode });
       return;
     }
 
@@ -368,7 +525,7 @@ export class TelegramApiMockServer {
       return;
     }
 
-    const parsed = parseTelegramMethodPathSafe(url.pathname);
+    const parsed = parseTelegramMethodPath(url.pathname);
     if (!parsed) {
       writeJson(res, 404, { ok: false, error_code: 404, description: "Not Found" });
       return;
@@ -376,6 +533,17 @@ export class TelegramApiMockServer {
 
     const payload = req.method === "GET" ? Object.fromEntries(url.searchParams.entries()) : await readJsonBody(req);
     const { token, method } = parsed;
+
+    if (this.mode === "passthrough") {
+      await this.passthroughTelegramRequest({
+        reqMethod: req.method ?? "POST",
+        token,
+        method,
+        payload,
+        res,
+      });
+      return;
+    }
 
     if (method === "getMe") {
       writeJson(res, 200, {
@@ -390,12 +558,7 @@ export class TelegramApiMockServer {
       return;
     }
 
-    if (method === "deleteWebhook") {
-      writeJson(res, 200, { ok: true, result: true });
-      return;
-    }
-
-    if (method === "setWebhook") {
+    if (method === "deleteWebhook" || method === "setWebhook") {
       writeJson(res, 200, { ok: true, result: true });
       return;
     }
@@ -462,5 +625,3 @@ export class TelegramApiMockServer {
     });
   }
 }
-
-export type { TelegramApiMockServerOptions };

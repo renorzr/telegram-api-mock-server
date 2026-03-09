@@ -24,6 +24,10 @@ It is designed for local and CI environments where you want to run integrations 
 - Optional hosts hijack lifecycle:
   - apply on `start()`
   - rollback on `stop()` and process exit
+- Runtime mode switching:
+  - `mock`: return mocked Telegram API behavior
+  - `passthrough`: forward traffic to real `https://api.telegram.org`
+- Admin SDK for mode toggling from test programs.
 
 ## Install
 
@@ -66,6 +70,30 @@ console.log(outboundCalls.map((call) => call.method));
 server.reset({ token, updates: true, outbound: true });
 ```
 
+## Runtime mock switch (Node.js SDK)
+
+```ts
+import { createTelegramApiMockAdminClient } from "telegram-api-mock-server";
+
+const admin = createTelegramApiMockAdminClient({
+  baseUrl: "http://127.0.0.1:19090",
+  adminToken: "change-me",
+});
+
+await admin.enableMock(); // mode => mock
+await admin.disableMock(); // mode => passthrough (real Telegram API)
+
+const status = await admin.getStatus();
+console.log(status.mode);
+```
+
+Admin endpoints used by SDK:
+
+- `GET /_admin/status`
+- `POST /_admin/mode` with `{ "mode": "mock" | "passthrough" }`
+
+Set `admin.token` on server startup to protect these endpoints.
+
 ## Inject and assert
 
 ```bash
@@ -96,6 +124,10 @@ import { TelegramApiMockServer } from "telegram-api-mock-server";
 const server = new TelegramApiMockServer({
   host: "127.0.0.1",
   port: 443,
+  mode: "passthrough",
+  admin: {
+    token: "change-me",
+  },
   tls: {
     certPath: "/path/to/api.telegram.org.crt",
     keyPath: "/path/to/api.telegram.org.key",
@@ -116,6 +148,24 @@ Notes:
 - `enableHostsHijack` needs write permission to hosts file (usually `sudo`).
 - For Node clients, trust your test CA with `NODE_EXTRA_CA_CERTS`.
 - Keep interception isolated to test environments.
+
+## Global install + daemon style run (Linux)
+
+```bash
+npm install -g telegram-api-mock-server
+
+# Start in foreground (common for CI/service wrappers)
+telegram-api-mock-server start \
+  --host 127.0.0.1 \
+  --port 443 \
+  --mode passthrough \
+  --admin-token change-me \
+  --enable-hosts-hijack \
+  --tls-cert /etc/telegram-mock/api.telegram.org.crt \
+  --tls-key /etc/telegram-mock/api.telegram.org.key
+```
+
+When `--enable-hosts-hijack` is set and `/etc/hosts` is not writable, the CLI attempts a `sudo` re-exec automatically.
 
 ## Development
 
