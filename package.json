@@ -1,11 +1,11 @@
 {
     "name": "telegram-api-mock-server",
-    "version": "0.1.8",
+    "version": "0.1.9",
     "description": "Telegram Bot API mock server for local and CI tests",
-    "homepage": "https://renorzr.github.io/clawchef",
+    "homepage": "https://github.com/renorzr/telegram-api-mock-server",
     "repository": {
       "type": "git",
-      "url": "git+https://github.com/renorzr/clawchef.git"
+      "url": "git+https://github.com/renorzr/telegram-api-mock-server.git"
     },
     "type": "module",
     "main": "dist/index.js",
