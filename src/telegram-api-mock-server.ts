@@ -294,6 +294,18 @@ export class TelegramApiMockServer {
     return input.replace(pattern, "\n").replace(/\n{3,}/g, "\n\n");
   }
 
+  private isHostsHijackActive(): boolean {
+    const start = `# BEGIN ${this.interception.marker}`;
+    const end = `# END ${this.interception.marker}`;
+    const expected = `${this.interception.ip} ${this.interception.domain}`;
+    try {
+      const content = readFileSync(this.interception.hostsFilePath, "utf8");
+      return content.includes(start) && content.includes(end) && content.includes(expected);
+    } catch {
+      return false;
+    }
+  }
+
   private installExitCleanupHandlers(): void {
     if (this.installedExitCleanup) {
       return;
@@ -458,7 +470,8 @@ export class TelegramApiMockServer {
       writeJson(res, 200, {
         ok: true,
         mode: this.mode,
-        interception: this.interception.enableHostsHijack,
+        interceptionConfigured: this.interception.enableHostsHijack,
+        hostsHijackActive: this.isHostsHijackActive(),
       });
       return;
     }

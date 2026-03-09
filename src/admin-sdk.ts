@@ -20,7 +20,8 @@ export type TelegramApiMockAdminClientOptions = {
 export type TelegramApiMockAdminStatus = {
   ok: true;
   mode: TelegramApiMockMode;
-  interception: boolean;
+  interceptionConfigured: boolean;
+  hostsHijackActive: boolean;
 };
 
 function trimSlash(value: string): string {

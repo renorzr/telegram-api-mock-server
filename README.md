@@ -21,9 +21,9 @@ It is designed for local and CI environments where you want to run integrations 
   - `POST /_mock/reset`
   - `GET /_mock/health`
 - Optional TLS mode.
-- Optional hosts hijack lifecycle:
-  - apply on `start()`
-  - rollback on `stop()` and process exit
+- Interception modes:
+  - `hosts` mode (legacy): map `api.telegram.org` in hosts file
+  - `nftables` mode (recommended): nftables + IP set style redirect for `api.telegram.org`
 - Runtime mode switching:
   - `mock`: return mocked Telegram API behavior
   - `passthrough`: forward traffic to real `https://api.telegram.org`
@@ -85,6 +85,7 @@ await admin.disableMock(); // mode => passthrough (real Telegram API)
 
 const status = await admin.getStatus();
 console.log(status.mode);
+console.log(status.interceptionConfigured, status.hostsHijackActive);
 ```
 
 Admin endpoints used by SDK:
@@ -116,14 +117,14 @@ curl -sS -X POST "http://127.0.0.1:19090/_mock/injectUpdate" \
 curl -sS "http://127.0.0.1:19090/_mock/outbound?token=123456:test-token"
 ```
 
-## TLS + automatic hosts hijack
+## TLS + nftables interception (recommended)
 
 ```ts
 import { TelegramApiMockServer } from "telegram-api-mock-server";
 
 const server = new TelegramApiMockServer({
   host: "127.0.0.1",
-  port: 443,
+  port: 19090,
   mode: "passthrough",
   admin: {
     token: "change-me",
@@ -132,12 +133,6 @@ const server = new TelegramApiMockServer({
     certPath: "/path/to/api.telegram.org.crt",
     keyPath: "/path/to/api.telegram.org.key",
   },
-  interception: {
-    enableHostsHijack: true,
-    hostsFilePath: "/etc/hosts",
-    domain: "api.telegram.org",
-    ip: "127.0.0.1",
-  },
 });
 
 await server.start();
@@ -145,27 +140,82 @@ await server.start();
 
 Notes:
 
-- `enableHostsHijack` needs write permission to hosts file (usually `sudo`).
+- `nftables` mode needs root privileges to apply redirect rules.
 - For Node clients, trust your test CA with `NODE_EXTRA_CA_CERTS`.
 - Keep interception isolated to test environments.
+
+## OpenClaw environment variables
+
+When OpenClaw is the Telegram Bot API client and traffic is hijacked to this mock server, OpenClaw must trust your test CA.
+
+Required:
+
+- `NODE_EXTRA_CA_CERTS=/path/to/test-ca.crt`
+
+Example:
+
+```bash
+NODE_EXTRA_CA_CERTS=/etc/telegram-mock/test-ca.crt openclaw gateway start
+```
+
+If OpenClaw runs under systemd, set the same variable in the service unit:
+
+```ini
+[Service]
+Environment=NODE_EXTRA_CA_CERTS=/etc/telegram-mock/test-ca.crt
+```
+
+Do not use `NODE_TLS_REJECT_UNAUTHORIZED=0` in normal test setups.
 
 ## Global install + daemon style run (Linux)
 
 ```bash
 npm install -g telegram-api-mock-server
 
-# Start in foreground (common for CI/service wrappers)
+# One command install (includes bootstrap: cert generation + service setup)
+telegram-api-mock-server install-service
+
+# Check install/runtime status
+telegram-api-mock-server status
+
+# Print test CA path for NODE_EXTRA_CA_CERTS wiring
+telegram-api-mock-server print-ca-path
+
+# Optional: uninstall service
+telegram-api-mock-server uninstall-service
+```
+
+Advanced install options (override defaults):
+
+```bash
+telegram-api-mock-server install-service \
+  --service-name telegram-api-mock-server \
+  --host 127.0.0.1 \
+  --port 19090 \
+  --redirect-port 19090 \
+  --mode passthrough \
+  --intercept-mode nftables \
+  --refresh-seconds 60 \
+  --admin-token change-me \
+  --cert-dir /etc/telegram-mock
+```
+
+Start in foreground (without systemd):
+
+```bash
 telegram-api-mock-server start \
   --host 127.0.0.1 \
-  --port 443 \
+  --port 19090 \
+  --redirect-port 19090 \
   --mode passthrough \
+  --intercept-mode nftables \
+  --refresh-seconds 60 \
   --admin-token change-me \
-  --enable-hosts-hijack \
   --tls-cert /etc/telegram-mock/api.telegram.org.crt \
   --tls-key /etc/telegram-mock/api.telegram.org.key
 ```
 
-When `--enable-hosts-hijack` is set and `/etc/hosts` is not writable, the CLI attempts a `sudo` re-exec automatically.
+When privileged access is required (`bootstrap`, `install-service`, or `start` with interception enabled), the CLI attempts a `sudo` re-exec automatically.
 
 ## Development
 

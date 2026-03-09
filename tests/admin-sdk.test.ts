@@ -21,6 +21,8 @@ test("admin sdk toggles mock mode", async () => {
 
   const initial = await client.getStatus();
   assert.equal(initial.mode, "mock");
+  assert.equal(typeof initial.interceptionConfigured, "boolean");
+  assert.equal(typeof initial.hostsHijackActive, "boolean");
 
   const switched = await client.disableMock();
   assert.equal(switched.mode, "passthrough");
