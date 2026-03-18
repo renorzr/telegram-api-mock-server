@@ -36,6 +36,12 @@ test("admin sdk toggles mock mode", async () => {
   const health = await client.health();
   assert.equal(health.ok, true);
 
+  const logs = await client.listLogs({ limit: 10 });
+  assert.equal(logs.ok, true);
+  assert.equal(Array.isArray(logs.logs), true);
+  assert.equal(typeof logs.nextSinceId, "number");
+  assert.equal(logs.logs.some((event) => event.path === "/_admin/status" || event.path === "/_mock/health"), true);
+
   const token = "sdk-token";
   const injected = await client.injectUpdate({
     token,

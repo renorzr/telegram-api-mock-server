@@ -1,5 +1,21 @@
 import type { TelegramApiMockMode } from "./telegram-api-mock-server.js";
 
+export type TelegramApiMockRequestLog = {
+  id: number;
+  ts: string;
+  plane: "api" | "admin";
+  method: string;
+  path: string;
+  status: number;
+  durationMs: number;
+  mode: TelegramApiMockMode;
+  tokenHint?: string;
+  error?: string;
+  updatesCount?: number;
+  latestUpdateType?: string;
+  textPreview?: string;
+};
+
 export class TelegramApiMockAdminError extends Error {
   readonly status: number;
   readonly code: string;
@@ -47,6 +63,12 @@ export type TelegramApiMockResetResponse = {
 export type TelegramApiMockHealthResponse = {
   ok: true;
   mode: TelegramApiMockMode;
+};
+
+export type TelegramApiMockListLogsResponse = {
+  ok: true;
+  logs: TelegramApiMockRequestLog[];
+  nextSinceId: number;
 };
 
 function trimSlash(value: string): string {
@@ -140,6 +162,17 @@ export function createTelegramApiMockAdminClient(options: TelegramApiMockAdminCl
     },
     async health(): Promise<TelegramApiMockHealthResponse> {
       return request<TelegramApiMockHealthResponse>("/_mock/health", { method: "GET" });
+    },
+    async listLogs(input?: { limit?: number; sinceId?: number }): Promise<TelegramApiMockListLogsResponse> {
+      const search = new URLSearchParams();
+      if (input?.limit != null) {
+        search.set("limit", String(input.limit));
+      }
+      if (input?.sinceId != null) {
+        search.set("sinceId", String(input.sinceId));
+      }
+      const suffix = search.size > 0 ? `?${search.toString()}` : "";
+      return request<TelegramApiMockListLogsResponse>(`/_mock/logs${suffix}`, { method: "GET" });
     },
   };
 }

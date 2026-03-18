@@ -6,6 +6,7 @@ export {
 export type {
   TelegramApiMockMode,
   TelegramApiMockOutboundCall,
+  TelegramApiMockRequestLog,
   TelegramApiMockServerOptions,
 } from "./src/telegram-api-mock-server.js";
 export type {
@@ -16,4 +17,5 @@ export type {
   TelegramApiMockListOutboundResponse,
   TelegramApiMockResetResponse,
   TelegramApiMockHealthResponse,
+  TelegramApiMockListLogsResponse,
 } from "./src/admin-sdk.js";

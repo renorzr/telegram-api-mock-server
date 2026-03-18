@@ -6,6 +6,22 @@ import { resolve4 } from "node:dns/promises";
 
 export type TelegramApiMockMode = "mock" | "passthrough";
 
+export type TelegramApiMockRequestLog = {
+  id: number;
+  ts: string;
+  plane: "api" | "admin";
+  method: string;
+  path: string;
+  status: number;
+  durationMs: number;
+  mode: TelegramApiMockMode;
+  tokenHint?: string;
+  error?: string;
+  updatesCount?: number;
+  latestUpdateType?: string;
+  textPreview?: string;
+};
+
 export type TelegramApiMockServerOptions = {
   host?: string;
   port?: number;
@@ -52,6 +68,8 @@ type TokenState = {
   nextMessageId: number;
 };
 
+const DEFAULT_REQUEST_LOG_LIMIT = 1000;
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -82,6 +100,38 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   }
 }
 
+async function readTelegramRequestBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  if (chunks.length === 0) {
+    return {};
+  }
+
+  const raw = Buffer.concat(chunks).toString("utf8");
+  const contentType = (req.headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase();
+
+  if (contentType === "application/x-www-form-urlencoded") {
+    const params = new URLSearchParams(raw);
+    const payload: Record<string, unknown> = {};
+    for (const [key, value] of params.entries()) {
+      payload[key] = value;
+    }
+    return payload;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
 function asNumber(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
@@ -101,6 +151,45 @@ function asString(value: unknown): string | undefined {
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function textPreview(value: string): string {
+  return Array.from(value).slice(0, 10).join("");
+}
+
+function detectUpdateType(update: TelegramUpdate | undefined): string | undefined {
+  if (!update) {
+    return undefined;
+  }
+  if (update.message && typeof update.message === "object") {
+    return "message";
+  }
+  if (update.callback_query && typeof update.callback_query === "object") {
+    return "callback_query";
+  }
+  for (const key of Object.keys(update)) {
+    if (key !== "update_id") {
+      return key;
+    }
+  }
+  return undefined;
+}
+
+function extractUpdateText(update: TelegramUpdate | undefined): string | undefined {
+  if (!update) {
+    return undefined;
+  }
+  if (typeof update.text === "string" && update.text.length > 0) {
+    return update.text;
+  }
+  const message = update.message;
+  if (message && typeof message === "object" && !Array.isArray(message)) {
+    const messageText = (message as Record<string, unknown>).text;
+    if (typeof messageText === "string" && messageText.length > 0) {
+      return messageText;
+    }
+  }
+  return undefined;
 }
 
 function parseTelegramMethodPath(pathname: string): { token: string; method: string } | null {
@@ -140,7 +229,11 @@ export class TelegramApiMockServer {
   private readonly upstreamBaseUrl: URL;
   private readonly passthroughTimeoutMs: number;
   private readonly bypassHostsForTelegramDomain: boolean;
+  private readonly requestLogLimit: number;
   private readonly states = new Map<string, TokenState>();
+  private readonly requestLogs: TelegramApiMockRequestLog[] = [];
+  private readonly requestLogDetails = new WeakMap<ServerResponse, Pick<TelegramApiMockRequestLog, "updatesCount" | "latestUpdateType" | "textPreview">>();
+  private nextRequestLogId = 1;
   private readonly server: ReturnType<typeof createServer> | TlsServer;
   private readonly adminServer?: ReturnType<typeof createServer>;
   private installedExitCleanup = false;
@@ -164,6 +257,7 @@ export class TelegramApiMockServer {
     this.upstreamBaseUrl = new URL(options.passthrough?.upstreamBaseUrl ?? "https://api.telegram.org");
     this.passthroughTimeoutMs = options.passthrough?.timeoutMs ?? 15000;
     this.bypassHostsForTelegramDomain = options.passthrough?.bypassHostsForTelegramDomain ?? true;
+    this.requestLogLimit = DEFAULT_REQUEST_LOG_LIMIT;
 
     if (this.tls) {
       this.server = createTlsServer(
@@ -338,6 +432,16 @@ export class TelegramApiMockServer {
     }
   }
 
+  listRequestLogs(params?: { limit?: number; sinceId?: number }): TelegramApiMockRequestLog[] {
+    const limit = Math.max(1, Math.min(params?.limit ?? 100, this.requestLogLimit));
+    const sinceId = params?.sinceId ?? 0;
+    const filtered = this.requestLogs.filter((event) => event.id > sinceId);
+    if (filtered.length <= limit) {
+      return filtered;
+    }
+    return filtered.slice(filtered.length - limit);
+  }
+
   private stripHostsBlock(input: string, start: string, end: string): string {
     const escapedStart = start.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const escapedEnd = end.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -385,6 +489,72 @@ export class TelegramApiMockServer {
     };
     this.states.set(token, created);
     return created;
+  }
+
+  private maskToken(token: string): string {
+    if (token.length <= 6) {
+      return "***";
+    }
+    return `${token.slice(0, 4)}...${token.slice(-2)}`;
+  }
+
+  private recordRequestLog(input: Omit<TelegramApiMockRequestLog, "id" | "ts">): void {
+    const entry: TelegramApiMockRequestLog = {
+      id: this.nextRequestLogId,
+      ts: nowIso(),
+      ...input,
+    };
+    this.nextRequestLogId += 1;
+    this.requestLogs.push(entry);
+    if (this.requestLogs.length > this.requestLogLimit) {
+      this.requestLogs.splice(0, this.requestLogs.length - this.requestLogLimit);
+    }
+  }
+
+  private setRequestLogDetails(
+    res: ServerResponse,
+    details: Partial<Pick<TelegramApiMockRequestLog, "updatesCount" | "latestUpdateType" | "textPreview">>,
+  ): void {
+    const previous = this.requestLogDetails.get(res) ?? {};
+    const next = {
+      ...previous,
+      ...details,
+    };
+    this.requestLogDetails.set(res, next);
+  }
+
+  private installRequestLog(req: IncomingMessage, res: ServerResponse, plane: "api" | "admin"): void {
+    const startedAt = Date.now();
+    const parsed = parseTelegramMethodPath(req.url ? new URL(req.url, "http://localhost").pathname : "");
+    const tokenHint = parsed ? this.maskToken(parsed.token) : undefined;
+    const path = req.url ? new URL(req.url, "http://localhost").pathname : "/";
+    const method = req.method ?? "GET";
+    let done = false;
+    const finish = (error?: string) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      const details = this.requestLogDetails.get(res);
+      this.requestLogDetails.delete(res);
+      this.recordRequestLog({
+        plane,
+        method,
+        path,
+        status: res.statusCode || 0,
+        durationMs: Date.now() - startedAt,
+        mode: this.mode,
+        tokenHint,
+        error,
+        ...details,
+      });
+    };
+    res.once("finish", () => {
+      finish();
+    });
+    res.once("close", () => {
+      finish();
+    });
   }
 
   private recordOutbound(token: string, method: string, payload: Record<string, unknown>): void {
@@ -541,6 +711,7 @@ export class TelegramApiMockServer {
   }
 
   private async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    this.installRequestLog(req, res, "api");
     const url = new URL(req.url ?? "/", "http://localhost");
 
     if (this.adminServer) {
@@ -566,7 +737,7 @@ export class TelegramApiMockServer {
       return;
     }
 
-    const payload = req.method === "GET" ? Object.fromEntries(url.searchParams.entries()) : await readJsonBody(req);
+    const payload = req.method === "GET" ? Object.fromEntries(url.searchParams.entries()) : await readTelegramRequestBody(req);
     const { token, method } = parsed;
 
     if (this.mode === "passthrough") {
@@ -643,6 +814,13 @@ export class TelegramApiMockServer {
 
     if (method === "getUpdates") {
       const updates = this.handleGetUpdates(token, payload);
+      const latestUpdate = updates[updates.length - 1];
+      const latestUpdateText = extractUpdateText(latestUpdate);
+      this.setRequestLogDetails(res, {
+        updatesCount: updates.length,
+        latestUpdateType: detectUpdateType(latestUpdate),
+        textPreview: latestUpdateText ? textPreview(latestUpdateText) : undefined,
+      });
       writeJson(res, 200, {
         ok: true,
         result: updates,
@@ -652,6 +830,10 @@ export class TelegramApiMockServer {
 
     if (method === "sendMessage") {
       this.recordOutbound(token, method, payload);
+      const messageText = asString(payload.text);
+      this.setRequestLogDetails(res, {
+        textPreview: messageText ? textPreview(messageText) : undefined,
+      });
       writeJson(res, 200, {
         ok: true,
         result: this.buildMessageResult(token, payload),
@@ -711,7 +893,12 @@ export class TelegramApiMockServer {
       return;
     }
 
-    if (method === "deleteMessage" || method === "pinChatMessage" || method === "unpinChatMessage") {
+    if (
+      method === "deleteMessage" ||
+      method === "pinChatMessage" ||
+      method === "unpinChatMessage" ||
+      method === "setMessageReaction"
+    ) {
       this.recordOutbound(token, method, payload);
       writeJson(res, 200, {
         ok: true,
@@ -728,6 +915,7 @@ export class TelegramApiMockServer {
   }
 
   private async routeAdminOnly(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    this.installRequestLog(req, res, "admin");
     const url = new URL(req.url ?? "/", "http://localhost");
     if (await this.handleControlPlaneRoute(req, res, url)) {
       return;
@@ -809,6 +997,17 @@ export class TelegramApiMockServer {
         outbound: typeof body.outbound === "boolean" ? body.outbound : undefined,
       });
       writeJson(res, 200, { ok: true, reset: true });
+      return true;
+    }
+
+    if (req.method === "GET" && url.pathname === "/_mock/logs") {
+      const limitRaw = asNumber(url.searchParams.get("limit"));
+      const sinceIdRaw = asNumber(url.searchParams.get("sinceId"));
+      const limit = limitRaw == null ? 100 : Math.max(1, Math.floor(limitRaw));
+      const sinceId = sinceIdRaw == null ? 0 : Math.max(0, Math.floor(sinceIdRaw));
+      const logs = this.listRequestLogs({ limit, sinceId });
+      const nextSinceId = logs.length === 0 ? sinceId : logs[logs.length - 1]!.id;
+      writeJson(res, 200, { ok: true, logs, nextSinceId });
       return true;
     }
 

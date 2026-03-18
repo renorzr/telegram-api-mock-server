@@ -22,6 +22,7 @@ When admin listener is enabled (default in CLI/service), control-plane routes ar
   - `sendDocument`
   - `editMessageText`
   - `answerCallbackQuery`
+  - `setMessageReaction`
   - `deleteMessage`
   - `pinChatMessage`
   - `unpinChatMessage`
@@ -248,6 +249,12 @@ telegram-api-mock-server status
 telegram-api-mock-server mock on
 telegram-api-mock-server mock off
 
+# Read recent request logs from control plane
+telegram-api-mock-server logs --limit 200
+
+# Follow request logs
+telegram-api-mock-server logs --follow
+
 # Optional: uninstall service
 telegram-api-mock-server uninstall-service
 ```
@@ -289,6 +296,16 @@ telegram-api-mock-server start \
 When privileged access is required (`bootstrap`, `install-service`, or `start` with interception enabled), the CLI attempts a `sudo` re-exec automatically.
 
 `status` output includes the generated CA path (`caPath`) and runtime mock state (`mockReachable`, `mockMode`, `mockEnabled`).
+
+`install-service` always installs the systemd unit with `mock` mode enabled at startup.
+
+Use `logs` to fetch request-level runtime logs (`/_mock/logs`), including API/admin plane, method, path, status, duration, and mode.
+
+If running under systemd, you can also read process logs directly:
+
+```bash
+journalctl -u telegram-api-mock-server -f
+```
 
 ## Development
 

@@ -235,6 +235,14 @@ test("mock server supports additional common outbound methods", async () => {
     { method: "deleteMessage", payload: { chat_id: 42, message_id: 10 } },
     { method: "pinChatMessage", payload: { chat_id: 42, message_id: 11 } },
     { method: "unpinChatMessage", payload: { chat_id: 42, message_id: 11 } },
+    {
+      method: "setMessageReaction",
+      payload: {
+        chat_id: 42,
+        message_id: 12,
+        reaction: [{ type: "emoji", emoji: ":thumbs_up:" }],
+      },
+    },
   ];
 
   for (const call of methodCalls) {
@@ -259,6 +267,134 @@ test("mock server supports additional common outbound methods", async () => {
   for (const call of methodCalls) {
     assert.equal(methodSet.has(call.method), true);
   }
+
+  await server.stop();
+});
+
+test("mock server exposes request logs", async () => {
+  const server = new TelegramApiMockServer({ host: "127.0.0.1", port: 0 });
+  await server.start();
+  const addr = server.getAddress();
+  assert.ok(addr);
+
+  const token = "4321:log-token";
+  const base = `http://127.0.0.1:${addr!.port}`;
+
+  const injectRes = await fetch(`${base}/_mock/injectUpdate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      token,
+      update: {
+        message: {
+          message_id: 1,
+          chat: { id: 42, type: "private" },
+          text: "abcdefghijk",
+        },
+      },
+    }),
+  });
+  assert.equal(injectRes.status, 200);
+
+  const getUpdatesRes = await fetch(`${base}/bot${token}/getUpdates`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ offset: 0, limit: 10 }),
+  });
+  assert.equal(getUpdatesRes.status, 200);
+
+  const sendRes = await fetch(`${base}/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: 42, text: "1234567890ABC" }),
+  });
+  assert.equal(sendRes.status, 200);
+
+  const logsRes = await fetch(`${base}/_mock/logs?limit=20`);
+  assert.equal(logsRes.status, 200);
+  const logsJson = (await logsRes.json()) as {
+    ok: boolean;
+    logs: Array<{
+      path: string;
+      method: string;
+      status: number;
+      tokenHint?: string;
+      updatesCount?: number;
+      latestUpdateType?: string;
+      textPreview?: string;
+    }>;
+    nextSinceId: number;
+  };
+
+  assert.equal(logsJson.ok, true);
+  assert.equal(Array.isArray(logsJson.logs), true);
+  assert.equal(typeof logsJson.nextSinceId, "number");
+  const sendMessageLog = logsJson.logs.find((entry) => entry.path === `/bot${token}/sendMessage`);
+  assert.ok(sendMessageLog);
+  assert.equal(sendMessageLog.method, "POST");
+  assert.equal(sendMessageLog.status, 200);
+  assert.equal(typeof sendMessageLog.tokenHint, "string");
+  assert.equal(sendMessageLog.textPreview, "1234567890");
+
+  const getUpdatesLog = logsJson.logs.find((entry) => entry.path === `/bot${token}/getUpdates`);
+  assert.ok(getUpdatesLog);
+  assert.equal(getUpdatesLog.method, "POST");
+  assert.equal(getUpdatesLog.status, 200);
+  assert.equal(getUpdatesLog.updatesCount, 1);
+  assert.equal(getUpdatesLog.latestUpdateType, "message");
+  assert.equal(getUpdatesLog.textPreview, "abcdefghij");
+
+  await server.stop();
+});
+
+test("telegram api methods accept application/x-www-form-urlencoded", async () => {
+  const server = new TelegramApiMockServer({ host: "127.0.0.1", port: 0 });
+  await server.start();
+  const addr = server.getAddress();
+  assert.ok(addr);
+
+  const token = "2468:form-token";
+  const base = `http://127.0.0.1:${addr!.port}`;
+
+  const injectRes = await fetch(`${base}/_mock/injectUpdate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      token,
+      update: {
+        message: {
+          message_id: 2,
+          chat: { id: 77, type: "private" },
+          text: "from-form-test",
+        },
+      },
+    }),
+  });
+  assert.equal(injectRes.status, 200);
+
+  const updatesRes = await fetch(`${base}/bot${token}/getUpdates`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ offset: "0", limit: "5" }).toString(),
+  });
+  assert.equal(updatesRes.status, 200);
+  const updates = (await updatesRes.json()) as {
+    ok: boolean;
+    result: Array<{ message?: { text?: string } }>;
+  };
+  assert.equal(updates.ok, true);
+  assert.equal(updates.result[0]?.message?.text, "from-form-test");
+
+  const sendRes = await fetch(`${base}/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ chat_id: "77", text: "form message" }).toString(),
+  });
+  assert.equal(sendRes.status, 200);
+  const sendJson = (await sendRes.json()) as { ok: boolean; result?: { text?: string; chat?: { id?: number } } };
+  assert.equal(sendJson.ok, true);
+  assert.equal(sendJson.result?.text, "form message");
+  assert.equal(sendJson.result?.chat?.id, 77);
 
   await server.stop();
 });

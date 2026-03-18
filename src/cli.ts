@@ -31,6 +31,10 @@ type CliOptions = {
   adminPort: number;
   upstreamBaseUrl?: string;
   serviceName: string;
+  logLimit: number;
+  logFollow: boolean;
+  logJson: boolean;
+  logPollMs: number;
   noSudoReexec: boolean;
 };
 
@@ -53,6 +57,10 @@ const DEFAULTS: CliOptions = {
   adminHost: "127.0.0.1",
   adminPort: 19091,
   serviceName: "telegram-api-mock-server",
+  logLimit: 100,
+  logFollow: false,
+  logJson: false,
+  logPollMs: 1000,
   noSudoReexec: false,
 };
 
@@ -68,6 +76,7 @@ function printHelp(): void {
       "  uninstall-service Stop and remove systemd service",
       "  status            Show runtime/install status",
       "  mock <on|off>     Toggle runtime mock mode",
+      "  logs              Read runtime request logs",
       "",
       "Common options:",
       "  --host <host>                    Bind host (default: 127.0.0.1)",
@@ -93,6 +102,10 @@ function printHelp(): void {
       "  --tls-key <path>                 TLS key path (default: <cert-dir>/<domain>.key)",
       "  --upstream-base-url <url>        Passthrough upstream URL",
       "  --service-name <name>            systemd service name",
+      "  --limit <n>                      Logs limit (default: 100)",
+      "  --follow                         Follow logs (for logs command)",
+      "  --json                           Print raw JSON logs",
+      "  --poll-ms <ms>                   Follow poll interval (default: 1000)",
     ].join("\n") + "\n",
   );
 }
@@ -216,6 +229,24 @@ function parseArgs(argv: string[]): CliOptions {
       i += 1;
       continue;
     }
+    if (arg === "--limit" && next) {
+      options.logLimit = Number(next);
+      i += 1;
+      continue;
+    }
+    if (arg === "--follow") {
+      options.logFollow = true;
+      continue;
+    }
+    if (arg === "--json") {
+      options.logJson = true;
+      continue;
+    }
+    if (arg === "--poll-ms" && next) {
+      options.logPollMs = Number(next);
+      i += 1;
+      continue;
+    }
     if (arg === "--no-sudo-reexec") {
       options.noSudoReexec = true;
       continue;
@@ -236,6 +267,12 @@ function parseArgs(argv: string[]): CliOptions {
   }
   if (!Number.isFinite(options.adminPort) || options.adminPort <= 0) {
     throw new Error("--admin-port must be a positive number");
+  }
+  if (!Number.isFinite(options.logLimit) || options.logLimit <= 0) {
+    throw new Error("--limit must be a positive number");
+  }
+  if (!Number.isFinite(options.logPollMs) || options.logPollMs < 200) {
+    throw new Error("--poll-ms must be at least 200");
   }
   if ((options.tlsCertPath && !options.tlsKeyPath) || (!options.tlsCertPath && options.tlsKeyPath)) {
     throw new Error("--tls-cert and --tls-key must be provided together");
@@ -326,6 +363,83 @@ async function setMockMode(options: CliOptions, mode: TelegramApiMockMode): Prom
     const message = body.error?.message ?? `Admin API returned HTTP ${response.status}`;
     throw new Error(message);
   }
+}
+
+type CliRequestLog = {
+  id: number;
+  ts: string;
+  plane: "api" | "admin";
+  method: string;
+  path: string;
+  status: number;
+  durationMs: number;
+  mode: TelegramApiMockMode;
+  tokenHint?: string;
+  error?: string;
+  updatesCount?: number;
+  latestUpdateType?: string;
+  textPreview?: string;
+};
+
+async function fetchRequestLogs(
+  options: CliOptions,
+  params: { sinceId: number; limit?: number },
+): Promise<{ logs: CliRequestLog[]; nextSinceId: number }> {
+  const query = new URLSearchParams();
+  query.set("sinceId", String(params.sinceId));
+  if (params.limit != null) {
+    query.set("limit", String(params.limit));
+  }
+  const response = await fetch(`http://${options.adminHost}:${options.adminPort}/_mock/logs?${query.toString()}`, {
+    method: "GET",
+    headers: buildAdminHeaders(options),
+  });
+  const body = (await response.json().catch(() => ({}))) as {
+    logs?: CliRequestLog[];
+    nextSinceId?: number;
+    error?: { message?: string };
+  };
+  if (!response.ok) {
+    throw new Error(body.error?.message ?? `Admin API returned HTTP ${response.status}`);
+  }
+  return {
+    logs: Array.isArray(body.logs) ? body.logs : [],
+    nextSinceId: typeof body.nextSinceId === "number" ? body.nextSinceId : params.sinceId,
+  };
+}
+
+function formatLogLine(log: CliRequestLog): string {
+  const parts = [
+    `[${log.ts}]`,
+    `${log.plane}`,
+    `${log.method}`,
+    `${log.path}`,
+    `status=${log.status}`,
+    `dur=${log.durationMs}ms`,
+    `mode=${log.mode}`,
+  ];
+  if (log.tokenHint) {
+    parts.push(`token=${log.tokenHint}`);
+  }
+  if (log.error) {
+    parts.push(`error=${log.error}`);
+  }
+  if (typeof log.updatesCount === "number") {
+    parts.push(`updates=${log.updatesCount}`);
+  }
+  if (log.latestUpdateType) {
+    parts.push(`latestType=${log.latestUpdateType}`);
+  }
+  if (log.textPreview) {
+    parts.push(`text=${JSON.stringify(log.textPreview)}`);
+  }
+  return parts.join(" ");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function maybeRunSudo(command: string, args: string[]): void {
@@ -640,12 +754,16 @@ async function commandBootstrap(options: CliOptions): Promise<void> {
 async function commandInstallService(options: CliOptions): Promise<void> {
   ensureSudoIfNeeded(true);
   bootstrapCertificates(options);
-  const unit = buildServiceUnit(options);
+  const serviceOptions: CliOptions = {
+    ...options,
+    mode: "mock",
+  };
+  const unit = buildServiceUnit(serviceOptions);
   const path = getServicePath(options.serviceName);
   writeFileSync(path, unit, "utf8");
   maybeRunSudo("systemctl", ["daemon-reload"]);
   maybeRunSudo("systemctl", ["enable", "--now", `${options.serviceName}.service`]);
-  process.stdout.write(`[telegram-api-mock-server] service installed: ${options.serviceName}\n`);
+  process.stdout.write(`[telegram-api-mock-server] service installed: ${options.serviceName} mode=mock\n`);
 }
 
 async function commandUninstallService(options: CliOptions): Promise<void> {
@@ -706,6 +824,39 @@ async function commandMock(options: CliOptions, action: MockCommandAction): Prom
   const mode: TelegramApiMockMode = action === "on" ? "mock" : "passthrough";
   await setMockMode(options, mode);
   process.stdout.write(`[telegram-api-mock-server] mode=${mode}\n`);
+}
+
+async function commandLogs(options: CliOptions): Promise<void> {
+  let sinceId = 0;
+  const firstBatch = await fetchRequestLogs(options, { sinceId, limit: options.logLimit });
+  sinceId = firstBatch.nextSinceId;
+  if (options.logJson) {
+    process.stdout.write(`${JSON.stringify(firstBatch.logs)}\n`);
+  } else {
+    for (const log of firstBatch.logs) {
+      process.stdout.write(`${formatLogLine(log)}\n`);
+    }
+  }
+
+  if (!options.logFollow) {
+    return;
+  }
+
+  while (true) {
+    await sleep(options.logPollMs);
+    const nextBatch = await fetchRequestLogs(options, { sinceId });
+    sinceId = nextBatch.nextSinceId;
+    if (nextBatch.logs.length === 0) {
+      continue;
+    }
+    if (options.logJson) {
+      process.stdout.write(`${JSON.stringify(nextBatch.logs)}\n`);
+      continue;
+    }
+    for (const log of nextBatch.logs) {
+      process.stdout.write(`${formatLogLine(log)}\n`);
+    }
+  }
 }
 
 async function commandStart(options: CliOptions): Promise<void> {
@@ -829,6 +980,10 @@ async function run(): Promise<void> {
   }
   if (command === "status") {
     await commandStatus(options);
+    return;
+  }
+  if (command === "logs") {
+    await commandLogs(options);
     return;
   }
 
